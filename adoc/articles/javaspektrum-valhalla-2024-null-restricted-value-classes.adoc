@@ -1,0 +1,663 @@
+= final value record Valhalla {} - "Java's episches Refactoring"
+
+Ich fühle mich schon wie bei der unendlichen Geschichte, seit nunmehr 10 Jahren arbeitet das JVM Team an "Value Types" (Valhalla) und genauso lange berichte ich schon darüber (HunXX, auch Hun0317). 
+
+Beim letzten JVM Language Summit (JVMLS) im August 2024, hat Brian Goetz ein vielversprechendes Update [Goetz24] gegeben, mit viel Humor aber noch mehr beeindruckendem Inhalt.
+Ich habe auch sein Video von 2014 [Goetz14] noch einmal angeschaut, nicht nur Valhalla, auch er ist deutlich reifer geworden.
+
+Dass die 10 Jahre in JavaLand wie im Flug vergangen sind, liegt nicht nur am beschleunigten Release-Zyklus mit vielen neuen Features und Verbesserungen, wie im Rückblick in der letzten Kolumne ausgeführt, sondern auch an der Beschleunigung im Ökosystem der Softwareentwicklung von cloudbasierten Architekturen, konsequenten CI/CD Ansätzen und schlussendlich dem Einzug von beeindruckenden Tools (wie CoPilot), die unsere Arbeitsweise deutlich verändern werden.
+
+Valhalla hat in dieser Zeit unter verschiedenen Namen und sehr vielen Experimenten (6 Prototypen) für die verschiedenen Aspekte von Konzeption, Typsystem, Migration, Sprachdesign und Implementierung in der Sprache und JVM langsam Fortschritte gemacht.
+
+In den letzten 2 Jahren hat, sich aus zwei eigentlich tangentiellen Ideen ein Denkansatz ergeben, der viele der bisherigen Komplexitäten und Probleme in sich selbst auflösen lässt. Das ist zum einen die Sichtbarkeit von teilweise initialisierten Objekten und zum anderen die Vermeidung von Null-Werten.
+
+Brian vergleicht die Phasen der Entwicklung mit dem Gartner Hype Zyklus, wo man sich am Ende fragt: "Das ist doch alles ganz einfach und sinnvoll, warum hat das jetzt so lange gedauert?"
+
+Im heutigen Artikel werden wir das Thema mit den neuen Erkenntnissen beleuchten, und einen kleinen Test von Valhalla vornehmen.
+
+Hier ein kurzer Vorgeschmack, wie eine Value-Klasse (oder ein Value-Record) aussehen könnte, siehe Listing {counter:listing}.
+
+.Listing {listing}
+[source,java]
+----
+value record Rectangle(double width, double height) extends Shape {
+    @Override double area() { return width*height; }
+    @Override double circumference() { return 2*(width+height); }
+}
+----
+
+== Eierpackung - Speichereffizienz in Java
+
+Die Herausforderung, in Java speichereffizient zu Arbeiten gibt es seit den Anfängen in der Mitte der 90er.
+"Alles ist ein Objekt" funktioniert nur dann performant, wenn die darunterliegende Implementierung es schafft, den Verschnitt durch Objekt-Header und -Zeiger bei Bedarf zu eliminieren.
+
+Leider ist das in Java bisher nicht der Fall, so dass selbst reine Daten wie Zahlen oder Wahrheitswerte als Objekte mit sehr viel "Wasserkopf" (16 Byte Objekt-Header plus Verschnitt für Speicherausrichtung, 32 oder 64-bit Zeiger) repräsentiert werden müssten.
+Das ist auch der Grund warum in der sonst so objektorientierten Sprache primitive Typen wie `byte, int, float, boolean` usw. als damals einzige Möglichkeit eingeführt werden mussten, um (numerische) Informationen kompakt abzulegen und effizient zu verarbeiten.
+Das hatte eine ganze Menge Sonderlocken zur Folge, von primitiven Arrays, Boxing, keine Generics für primitive Typen bis zu der unsäglichen Explosion von Interfaces für primitive Lambda-Functional Interfaces `DoubleToIntFunction` und primitive Streams wie `IntStream`.
+
+Somit wurde mit zweierlei Maß gemessen, auf der einen Seite hübsch objektorientiert, und wartungsfreundlich mit Vererbung, Delegation, Interfaces, Konstruktoren usw. und auf der anderen Seite brutal effizient, mit primitiven `int`, `byte` oder `float` Arrays, `ByteBuffer` anderen low-level APIs, die die Rohdaten in einer effizienten Form für die Massendatenverarbeitung repräsentierten [Hun0520, Hun0324].
+Zwischen den zwei Welten muss aufwendig konvertiert werden und stets die Abwägung getroffen werden, wofür jeder Teil der Anwendung optimiert werden soll.
+
+Mit einer effizienteren Repräsentation wird nicht nur Speicher für den Overhead gespart, durch den Verzicht auf Heap-Pointer die auf mehr oder weniger zufällige Speicherbereiche zeigen, können die Daten in einem fortlaufenden Bereich abgelegt werden, was für Lade-, Aktualsierungs- und Cacheverhalten sehr vorteilhaft ist.
+
+// Smaller memory footprint, better locality
+
+// Ein wichtiger Unterschied 
+
+In anderen Sprachen wird die Objektorientiertheit für Werttypen nur simuliert, so dass sie unter der Haube keine Objekte sein müssen und sie enthaltende Container können als Sprachkonstrukt eines `struct`-Typs abgelegt werden, die auch keine Objekt-Identität benötigen.
+
+Das ist auch die Idee für Java - Wie können wir Werttypen elegant der Sprache hinzufügen, so dass die meisten Features von Java erhalten bleiben und die JVM trotzdem ein effizientes Speicherlayout und Verarbeitung umsetzen kann?
+
+Das Werttypen nicht dasselbe sind wie Objekte ist hier der Grundgedanke. 
+Einige der Eigenschaften von Objekten sind nicht immer notwendig, und könnten bei Wegfall viele Optimierungen erlauben.
+
+Wie auch in "Domain-Driven-Design" (DDD, [Evans]), wo zwischen "lebendigen" Entitäten mit Identität, Lebenszyklus und Verantwortlichkeiten und den skalaren, unveränderlichen Werttypen die keine Identität besitzen, und die nur durch ihre Inhalte bestimmt sind, unterschieden wird.
+
+Ein Vorteil von Werttypen ist, dass ihre Instanzen, z.b. in einem Array gar nicht mehr gespeichert werden müssen, nur noch die enthaltenen Werte, das wird auch als "Heap flattening" bezeichnet, sowohl bei der Speicherung als auch bei Aufrufen wo sie dann auf dem Stack oder noch effizienter in Registern landen können.
+Solche Optimierungen werden zum Beispiel auch vom Graal Compiler als Teil der aggressiven JIT-Kompilierung vorgenommen.
+
+// todo reference vs. copy by value/by reference
+// container?
+// destructuring
+
+== Was bisher geschah - Wichtigste Aspekte der Werttypen
+
+Die genannte Inkonsistenz von Java war den Sprachdesignern schon immer ein Dorn im Auge, und die mangelnde Speichereffizienz gab Java lange den Ruf, langsam und verschwenderisch zu sein.
+// Mit genügend Aufwand kann man das zwar beheben, aber wirklich wartbar ist der Quellcode dann auch nicht mehr und man könnte gleich auf C oder andere systemnahe Sprachen zurückgreifen.
+
+Daher wird seit langem untersucht und experimentiert, wie das Problem gelöst werden kann, ohne das die Rückwärtskompatibilität von Java gefährdet wird und ohne Neuimplementierung des JDKs für Werttypen und der Beibehaltung von Generics.
+
+In den letzten 10 Jahren wurde im Rahmen des Valhalla Projektes mehrere Aspekte in diversen Prototypen untersucht.
+
+Ingesamt gibt es eine Reihe von Problemen zu lösen:
+
+* Welche Objekteigenschaften sind wirklich wichtig oder könnten optional sein, z.B. Identität, Veränderlichkeit?
+* Was geschieht mit Null-Werten?
+* Wie sieht die Initialisierung von Werttypen aus besonders auch von Arrays?
+* Wie können existierende Typen wie `Integer` oder `LocalDate` kompatibel migriert werden?
+* Welche Optimierung kann die JVM under der Haube vornehmen?
+* Wie verhält es sich mit Generics?
+* Was ist mit Serialisierung?
+* Gibt es weitere Themen, wie Operator Overloading?
+* Was passiert mit dem Speichermodel und atomarem Zugriff?
+
+Dabei wurde sowohl mit komplexen Änderungen an JVM, Sprache, Compiler und Laufzeitumgebung  (`VLOAD/VLSTORE` Bytecodes), Typsystem (L-World - angeglichene Typdeskriptoren) und einem schnellen, aber komplexen Programmiermodell (jeweils 2 Typen `Class.val` und `Class.ref``) das auch die Migration existierenden Codes sehr schwierig gemacht hätte experimentiert.
+In anderen Prototypen wurde untersucht, wie sich Werttypen auf das Typsystem und Generics auswirken würden.
+Jeder Schritt brachte neue Erkenntnisse, aber keinen wirklichen Durchbruch.
+
+Das Ziel war ja schliesslich ein sauberes Programmiermodell, das kompatiblen zu existierendem Code ist und trotzdem all die notwendigen Optimierungen möglich macht.
+
+== Wohin mit den Objekten?
+
+Wie schon erwähnt haben Objekte eine Reihe von Eigenschaften, die nützlich aber nicht immer notwendig sind.
+
+=== Identität oder nicht, das ist die Frage
+
+Das Hauptproblem stellt Identität dar, eine Entität mit Identität muss man stets nachverfolgen können und ihre Einzigartigkeit bewahren. 
+
+Identität wird nicht nur zum Zugriff und Vergleich von Referenzen genutzt, auch für Objektlayout, Speicherposition, Garbage Collection, Veränderlichkeit, Polymorphismus und Synchronisation/Locks ist sie vorteilhaft.
+
+Daher ist auch die Instanz/Wert- (`equals`) und Referenzgleichheit (`==`) nicht dasselbe, ersteres bezieht sich auf den Zustand (also meist die Werte) aber zweiteres auf die Identität.
+
+Aber benötigen Werttypen all dies? Was wäre möglich wenn es diese Garantien nicht mehr gäbe.
+
+Dann hätte die JVM viel mehr Möglichkeiten die Objekte als identitätsfreie Container von Werten zu betrachten, zu kopieren, und auseinanderzunehmen.
+Damit sind Objektreferenzen nur noch virtuell, soweit es möglich ist, werden die Werte direkt gespeichert, bei Erzeugung, Methodenaufrufen oder Rückgaben direkt in Registern oder im Stack abgelegt ohne den Objektrahmen zu benötigen.
+
+Bei Instanzen von Werttypen sind Instanz- und Referenzgleichheit dasselbe, da sie keine Identiät mehr haben und nur ihre Werte für den Vergleich relevant sind.
+// Instanzen von Werttypen sollen von von der JVM zur Laufzeit frei kopiert und repliziert werden, da nur ihre Werte relevant sind, es gibt keine Garantie für eine "Referenzgleichheit" mehr. Daher sind hier Instanz und Referenzgleichheit dasselbe.
+
+Das heisst aber nicht dass Werttypen nur dumme Container darstellen müssen, man kann sie trotzdem mit Methoden, Konstruktoren, Vererbung, Interfaces und mehr versehen, das sind ja Sprachkonstrukte die zur Laufzeit dann nur über die Werte gestülpt werden können.
+
+Damit können auch existierende Typen im JDK ihre API behalten (z.b. Zahlen, Strings, Zeitwerte, Cursors, Netzwerkinformationen), und trotzdem effizient zu Werttypen migriert werden.
+
+Im aktuellen Prototyp kann man mit dem `value` Schlüsselwort vor Klassen und Records auf die Objektidentät verzichten, und damit einige der genannten Vorteile schon erhalten.
+Es werden trotzdem Konstruktoren, Vererbung (von `Object` oder abstrakten Werttypen) und Interfaces untersützt.
+
+Aber Objekte sind ja auch noch veränderlich.
+
+===  Konstante Ansichten - Unveränderlichkeit
+
+Das heisst Feld-Werte können einmal geschrieben werden und sind dann in allen Referenzen des Objekt aktuell (nach den Sichtbarkeitsregeln des Java Speichermodells natürlich).
+
+Unveränderliche Werte wären viel besser, diese könnten beliebig kopiert werden, dann ergibt sich die Notwendigkeit nicht mehr allen "Instanzen" einen aktualisierten Wert bereitzustellen.
+
+Ein Problem für das Flachklopfen im Heap, Stack und Registern stellen auch veränderliche Instanzen die auf unveränderliche Instanzen zeigen und vice versa.
+Daher wäre es notwendig an diesen stellen durchgängig Unveränderlichkeit zu garantieren.
+
+Desweiteren haben unveränderliche Werte den Vorteil, dass sie nicht von Race-Conditions beim Laden von Werten betroffen sind, die größer als die atomaren Garantien des Prozessors sind (Tearing) (heute meist 64-bit, früher nur 32-bit was zu Problemen bei `long` und `double` Werten führte).
+
+Durch Vermeidung von Objekt-Allozierungen für den Objekt-Container, können unveränderliche Werte trotzdem hochperformant "erzeugt" werden.
+
+Ein Beispiel von Brian Goetz ist ein Cursor, der eine Referenz auf ein Feld und einen Offset speichert welcher bei Iteration unveränderlich erhöht wird, indem ein neuer Cursor erzeugt wird, siehe Listing {counter:listing}.
+
+.Listing {listing}
+[source,java]
+----
+value record ArrayCursor<T>(T[] base, int offset) {
+    boolean hasNext() { return offset < base.length; } 
+    ArrayCursor<T> advance() { return new ArrayCursor(base, offset+1); } 
+    T get() { return base[offset]; }
+}
+
+for (var c = new ArrayCursor<>(arr, 0); c.hasNext(); c = c. advance()) {
+    T value = c.get()
+}
+----
+
+// can be freely duplicated and re-encoded by the JVM at run time
+
+=== Wohin mit der Null -  Nullability & Null Restricted Types
+
+Im Vortrag beim JVMLS hat Brian Goetz von einem Durchbruch berichtet, der aus einer etwas unerwarteten Ecke kam und plötzlich viele Herausforderungen vereinfachte.
+
+Ein Thema dass die Software Community seit längerem beschäftigt, sind Null-Pointer, von ihrem Erfinder Tony Hoare auch als "Billion Dollar Mistake" [Hoare] bezeichnet.
+
+Da Werttypen ja keine Identität und Referenzen haben, kann man auch kein Null-Pointer für sie speichern, sie sind ja durch den Inhalt ihrer Werte bestimmt, und nichts anderes.
+Wie verhält es sich nun aber wenn die Instanz noch nicht exisitiert? 
+Gibt es das überhaupt, und was müsste man dann anstatt von `Null` benutzen?
+
+In einem früheren Prototypen wurde versucht Null komplett zu verbieten, aber das hatte zuviele Einschränkungen bei der Kompatibilität und Migration.
+
+Ggf. müsste man ein extra Bit für diesen Zustand reservieren, dass dann bei vielen Typen zu einer Verdopplung der Speicherbedarfs führen würde.
+Da Speicher auf 32 oder 64-bit aligned sein sollte, müssten dann 64 statt 32+1 oder 128 statt 64+1 bits belegt werden.
+
+Für die primitiven Typen werden die Standardwerte wie `0` oder `false` benutzt, aber diese tragen ja auch eine Bedeutung im Wertebereich.
+Es ist aber schwierig, diese für komplexere Typen automatisch zu inferieren, da deren "Standardwert" an einem anderen Punkt der Wertebereichen liegen kann.
+
+Daher ist der Vorschlag des JVM Teams jetzt dass Initialwerte für Werttypen immer vom Nutzer mit anzugeben sind, so dass die Initialisierung sofort mit diesen vorgenommen wird, und keine inferierten Defaultwerte nötig sind. [NullRestrictedValueTypes].
+Dasselbe soll auch für Felder von Werttypen gelten, diese können dann über ein neues Konstrukt mit einem Initialwert oder einer Lambda Expression befüllt werden, siehe Listing {counter:listing}.
+
+.Listing {listing} - Syntaxvorschläge für Initialisierung von Feldern
+[source,java]
+----
+String![] labels;
+
+labels = new String![]{ "x", "y", "z" };
+labels = new String![100]{ "" }; // suggested syntax
+labels = new String![100]{ i -> "x"+i }; // suggested syntax
+----
+
+Das zweite große Thema, dass mit der `@Null` und `@NotNull` Annotation ja schon einmal vorsichtig angefangen wurde, ist generell die Nullability (Optionalität) von Feldern, Parametern und Variablen.
+
+Hier ist jetzt der Vorschlag [NullRestrictedTypes] dass neben dem bisherigen `Typ name` auch explizit null-fähige Deklarationen mit einem Fragezeichen `Typ? name` und explizit nicht-null-erlaubte mit einem Ausrufezeichen `Typ! name` möglich sein sollen. [NullRestrictedTypes].
+In anderen Sprachen gibt es ähnliche Konstrukte, original kommen diese Quantifier aus regulären Ausdrücken.
+
+Dieser Ansatz soll es erlauben auch existierende Software und Bibliotheken weiterzuverwenden, ohne sie neu zu übersetzen oder zu aktualisieren (dann ohne die Vorteile) so dass die Migration schrittweise erfolgen kann.
+
+Initial soll das allgemein für alle Typen erfolgen, in einem zweiten Schritt, speziell für Werttypen [NullRestrictedValueTypes].
+
+Damit haben die JVM (Verifier) und die Runtime dann die Möglichkeit die notwendigen Verifikationen, Inferenzen und auch Optimierungen (wie der Verzicht auf das Extra-Bit für Werttypen und Möglichkeit des Zerlegens) vorzunehmen.
+
+// , und es müssen stets definierte Instanzen für sie vorliegen, zumeist werden dass für den Fall eines noch nicht definierten Inhalts ein spezieller Wert sein (z.b. 0 oder unendlich für Zahlen). 
+
+// Mit dem `value` Schlüsselwort wird ein neuer Typ definiert, für dessen Instanzen `Null` kein erlaubter Wert ist.
+// Optional können automatisch, null-äquivalente Werte definiert werden. 
+
+=== Initialisierung & Sichtbarkeit
+
+Die Initialisierung von Objekten ist in Java ja etwas schwierig.
+Während ein Objekt intialisiert wird, entspricht es nur teilweise den geforderten Invariaten. 
+Die Sichtbarkeit dieser partiell initiasierten Objekte wird von der Sprache und Runtime beschränkt, ist aber nicht wasserdicht.
+Um die Initialwerte für nicht-nullfähige Werttypen zuweisen, muss das erfolgen bevor der Superklassen-Konstruktur aufgerufen wird.
+
+Das Thema wird auch in [JEP482] relevant, der sich mit mehr Möglichkeiten von Konstruktoren (Code vor den Superklassen-Konstruktor-Aufrufen).
+Die Idee ist zum einen die Sichbarkeit dieser unvollständigen Objekte zu verhindern (mittels DA - "Definite Assignment" Analyse), bzw. vorzeitig zu befüllen.
+Felder für die Null kein erlaubter Wert darstellt, dürfen nie mit Null sichtbar sein, selbst wenn die JVM sie temporär so initialisiert.
+
+Auch bei der Deserialisierung stellt das ein Problem da, da hier zuerst Objekte ohne initialisierte Felder erzeugt und diese dann nachträglich befüllt werden, so dass "illegale" Zustände möglich sind.
+
+Es gibt zur Zeit Arbeit an Serialisierung, diese wird sich aber noch hinziehen. Bis dahin werden Werttypen nicht serialisierbar sein.
+
+Mit diesen neuen Bedingungen konnten viele der vorher notwendigen Änderungen entfernt werden, wie die neuen Bytecodes oder Typdeskriptoren.
+Notwendig bleiben nur ein `ACC_VALUE` Flag für Klassen und ein `ACC_STRICT` Bit sowie ein `NullRestricted` Attribut für Instanzvariablen.
+
+== Integration mit Objekten und Garbage Collection
+
+Werttypen können trotzdem in Objekten enthalten sein.
+Im ersteren Fall werden ihre Werte in das Objekt hineingeschrieben und nicht als Referenz gehalten.
+Das heisst wenn das Objekt vom Garbage Collector entfernt wird muss für die Wertobjekte, wie heute schon für primitive Werte keine extra Arbeit vorgenommen werden.
+Da jedes Wertobjekte nur relativ klein ist, macht es minimalen Platzunterschied innerhalb eines Objektes. 
+Listen oder Felder von Wertobjekten werden wie schon heute als Referenzen gehalten, aber dann innerhalb des Felds flachgeklopft und internalisiert.
+
+Sie können auch Referenzen zu Objekten enthalten, also nur den Pointer auf das Objekt.
+Das hat erst einmal für das Wertobjekt keine Bedeutung welche Bedeutung dieser 32 oder 64 bit Wert hat.
+
+// Korrekt??
+Für den Garbage Collector bedeutet es schon einen Mehraufwand, weil er ja ja potentiell an mehr Stellen und durch größere internalisierte Datenmengen durchlaufen muss, was bisher nur bei objektbasierten Strukturen (Feld von Strings mit Zeiger auf `char[]` Felder) notwendig war und dementsprechend teuer.
+Für primitive Werte gab es diese Fall ja nicht (`int[]`).
+
+Daher denke ich, ist eher davon abzuraten, in Werttypen Referenzen auf Objekte zu halten.
+
+== Die Liste der Möglichkeiten
+
+- heap flattening
+- register for calls and returns
+- no heap allocation
+- ...
+// Not full flattening, some flattening in heap (for small nullable < 64bits), full scalarization, in calling conversion + returns
+////
+Flattening / finality
+Throughout Immutability helps with data races
+Then we can flatten
+Mutable ref -> immutable object or immutable ref to mutable object are the issue
+
+Flatting scorecard
+Excellent on stack and calling convention as long as we have enough registers
+<64bit nullable or non-nullable 
+Larger value flattening requires relaxed atomictiy
+Need hardware support
+128 bits are quite large
+////
+
+== Der letzte Streich - JDK Klassen und Migration
+
+// Migration für existierende Partnerklassen für primitive Werte wie `Integer` oder `Double`.
+
+In [JEP402] wird diskutiert, wie die existierenden Kandidaten für Werttypen im JDK angepasst werden können, wahrscheinich in mehreren Schritten.
+
+Das sind zum einen Partnerklassen für primitive Werte wie `Integer!` oder `Double!`, für die würde das Boxing als spezifische Operation wegfallen, sie würden direkt durch ihre konstituierenden Werte dargestellt.
+
+Wie die Zukunft der primitiven Typen aussieht ist ungewiss, aber es ist unwahrscheinlich dass sie je aus Java verschwinden werden, jedes Java Programm enthält viel zu viele davon. Aber ggf. werden sie in Zukunft nur noch Aliase für die Werttypen sein.
+
+Andere Migrationen die geplant sind, ist die Nullfähigkeit an Signaturen und für Instanzvariablen zu vermerken, z.B. für Klassen die heute schon NotNull-Überprüfungen für Parameter vornehmen und damit sicherstellen, das diese Werte nicht null werden können. Diese würden dann manuell oder per Inferenz transistent durch das JDK und die JVM propagieren.
+Null für so deklarierte Werte zu nutzen, würden dann entweder zu einem Compiler-Fehler oder zu Null-Pointer Exceptions zur Laufzeit führen.
+
+Wie immer ist in Java binäre und Quelltextkompatibilität sehr kritisch, daher wird dies nur in Schitten erfolgen.
+
+Offene Fragen sind noch Kovarianz (Zuweisbarkeit) von Feldern `int[]` vs. `Integer![]`, wie primitive Typen als Methodenempfänger agieren können und wie generische Typargumente abgebildet werden.
+
+////
+Remainder JEP 402
+Eliminate differences between Integer! And int
+Receiver (num.toString)
+Type arguments
+Covariance
+int[] vs. Integer![]
+
+
+Introduce a new kind of type for value classes that excludes null from its value set, much like primitive types that cannot be null.
+
+Allow a value class to "opt in" to the automatic creation of an appropriate default value used to initialize fields and arrays that don't store null.
+
+Allow larger value classes to further "opt in" to non-atomic encodings in fields and arrays that don't store null.
+
+Support compatible migration of existing classes. Apply these properties to value classes in the Java platform, including the classes used for primitive boxing.
+
+=== Null Restricted Value Classes
+
+Von Aussen sieht das ganze sehr minimalistisch aus, einfach ein `value` vor `class` oder `record` schreiben, und schon hat man eine Value Class?
+
+Was bewirkt das?
+
+// Allow the type of a variable storing value objects to exclude null, enabling more compact storage and other optimizations at run time. This is a preview language and VM feature.
+
+Records machen die ganze Sache noch einmal einfacher, da sie schon einen Kontrakt für Gleichheit (`equals`), `hashCode` und `toString` mitbringen.
+
+- null restricted value classes
+
+[source,java]
+----
+value record Point(int x, int y) {
+    public Point {
+        if (x < 0 || y < 0) {
+            throw new IllegalArgumentException("x and y must be positive");
+        }
+    }
+}
+----
+
+Brian Goetz: JVMLS 2024 - Valhalla - Where Are We?
+Aug 2024 
+https://www.youtube.com/watch?v=IF9l8fYfSnI
+
+
+Presented by Brian Goetz - Java Language Architect (Java Platform Group - Oracle) during the JVM Language Summit (August 2024 - Santa Clara, CA).
+
+Project Valhalla wants to heal the rift in #Java's type system between classes and primitives by introducing value classes, which "code like a class, work like an int" and offer a flat and dense memory layout. Java's epic refactor, as it has been dubbed, has been going on for 10 years but is now entering the home stretch. At #JVMLS 2024, Java Language Architect Brian Goetz explained the proposed solution: value classes (already available in an EA build), null-restricted types, beefed up definite assignment analysis, and strict initialization.
+
+
+JEP401 - 
+JEP402 -
+
+EAP JDK from 
+
+/Library/Java/JavaVirtualMachines/valhalla-jdk-23.jdk 
+////
+
+== Ein kleiner Test
+
+Laut Brian Goetz ist die erreichte Performance-Verbesserung schon beeindruckend:
+
+* Matrix Multiplikation ist 6x schneller bei einer Reduktion der Speicherallokation um einen Faktor 100.
+* Iteration über ein Array ist im for-loop 3-mal schneller, mit Streams so gar 12-mal.
+* Besonders hat er die 8-mal schnellere Berechnung von Aggregaten mit einem unveränderlichen Akkumulator (also Neuerzeugung und Zuweisung) hervorgehoben.
+
+Da der Valhalla-Build von Java 23 [Build] jetzt verfügbar ist, können wir auch zumindest einen kleinen Performancetest machen.
+
+In Erinnerung an den Beginn meiner Programmierkarriere vor fast 40 Jahren (autsch) in Basic und Maschinencode, nehme ich eine Liste von geometrischen Figuren und lasse deren Flächeninhalte berechnen, wir lassen ihre Größe waschen bis wir 100 Millionen neuer Objekte abgeleitet haben, siehe Listing {counter:listing} 
+
+Das ganze wird einmal mit Wert-Records und einmal mit regulären Objekt-Records implementiert, so dass wir den Geschwindigkeitsunterschied beim Erzeugen und Berechnen sehen können. 
+
+.Listing {listing} - Typdefinitionen
+[source,java]
+----
+class ValhallaTest {
+    interface Shape {
+        double area();
+        double circumference();
+        Shape derive(double multiplier);
+    }
+    // das *value* Schlüsselwort ist hier der einzige Unterschied im Quelltext, sonst muss nichts geändert werden
+    value record Rectangle(double width, double height) implements Shape {
+         @Override
+         public double area() {
+             return width*height;
+         }
+         @Override
+         public double circumference() {
+             return 2*(width+height);
+         }
+
+        @Override
+        public Rectangle derive(double multiplier) {
+            return new Rectangle(width*multiplier, height*multiplier);
+        }
+    }
+
+    public static void main(String...args) {
+        // warmup
+        for (int i=0;i<10;i++) {
+            benchmark(PrintStream.nullOutputStream());
+        }
+        benchmark(System.out);
+    }
+----
+
+.Listing {listing} - Benchmark Methode
+[source,java]
+----
+    public static final int SIZE = 100_000_000;
+    public static final double MULTIPLIER = 1; 
+    // 1.001; Multiplikation dominiert Erzeugung
+
+    private static void benchmark(OutputStream os) {
+        var printStream = new PrintStream(os);
+        var start = System.currentTimeMillis();
+        Shape[] shapes = new Rectangle[SIZE];
+        shapes[0]=new Rectangle(Math.E,Math.PI);
+        for (int i = 1; i< SIZE; i++) {
+            shapes[i]=shapes[i-1].derive(MULTIPLIER);
+        }
+        var time = System.currentTimeMillis();
+        printStream.printf("Creating %d shapes took %d ms%n",SIZE, time - start);
+        start = System.currentTimeMillis();
+        double res = Stream.of(shapes).mapToDouble(s -> s.area() + s.circumference()).sum();
+        printStream.printf("Stream Computing area and circumference of %d shapes took %d ms sum is %.2f%n",SIZE, time - start, res);
+        start = System.currentTimeMillis();
+        res = 0;
+        for (int i = 0; i< SIZE; i++) {
+            res += shapes[i].area();
+            res += shapes[i].circumference();
+        }
+        time = System.currentTimeMillis();
+        printStream.printf("Computing area and circumference of %d shapes took %d ms sum is %.2f%n",SIZE, time - start, res);
+        start = System.currentTimeMillis();
+        boolean same = false;
+        for (int i = 1; i< SIZE; i++) {
+            same |= shapes[i] == shapes[i-1];
+        }
+        time = System.currentTimeMillis();
+        printStream.printf("Comparing %d shapes took %d ms are any of them the same %s%n",SIZE, time - start, same);
+        start = System.currentTimeMillis();
+        same = false;
+        for (int i = 1; i< SIZE; i++) {
+            same |= shapes[i].equals(shapes[i-1]);
+        }
+        time = System.currentTimeMillis();
+        printStream.printf("Comparing %d rectangles took %d ms are any of them the equal %s%n",SIZE, time - start, same);
+        printStream.println("recs[SIZE-1] = " + shapes[SIZE - 1]);
+    }
+}
+----
+
+In den Ergebnissen wird folgendes deutlich:
+
+* Erzeugung von Werttypen ist etwas schneller, das ist aber abhängig vom Typ des Feldes, wenn es der konkrete Werttyp `Rectangle[]` ist es schneller, bei dem Interface-Typ `Shape[]` nicht.
+* Multiplikation dominiert die Erzeugung, dh. wenn der Multiplier != 1 also nicht herausoptimiert werden kann.
+* Stream Verarbeitung ist etwas schneller für Werttypen, die For-Schleife ist ungefährt genauso schnell.
+* Referenz und Wertvergleich bei Wertobjekten ist diesselbe Operation, dauert also diesselbe Zeit und sie sind immer gleich wenn sie diesselben Werte haben.
+* Bei regulären Objekten ist der Referenz-Vergleich (Pointer) viel schneller, und niemals gleich. Beim deutlich langsameren Wertvergleich ist das anders.
+
+.Listing {listing} - Benchmark Ergebnisse
+----
+// Value type record:
+Multiplier: 1
+Creating 100000000 shapes took 540 ms
+Stream Computing area and circumference of 100000000 shapes took 510 ms sum is 2025948318,68
+Computing area and circumference of 100000000 shapes took 190 ms sum is 2025948315,82
+Comparing 100000000 shapes took 117 ms are any of them the same true
+Comparing 100000000 rectangles took 116 ms are any of them the equal true
+recs[SIZE-1] = Rectangle[width=2.718281828459045, height=3.141592653589793]
+
+// Regular Records (reference equality faster than value equality)
+Multiplier: 1
+Creating 100000000 shapes took 654 ms
+Stream Computing area and circumference of 100000000 shapes took 575 ms sum is 2025948318,68
+Computing area and circumference of 100000000 shapes took 193 ms sum is 2025948315,82
+Comparing 100000000 shapes took 19 ms are any of them the same false
+Comparing 100000000 rectangles took 267 ms are any of them the equal true
+recs[SIZE-1] = Rectangle[width=2.718281828459045, height=3.141592653589793]
+----
+
+Ein weiterer interessanter Test wäre die Baseline Implementierung der 1 Billion Row Challenge [Morling] über die ich berichtet habe, mit den Valhalla Werttypen umzusetzen und die Leistungsänderung zu bewerten.
+
+Ich habe das mit Gunnar Morling's Code gemacht, eigentlich nur das `value` Schlüsselwort für die `Measurement`, `ResultRow` und `MeasurementAggregator` Records genutzt.
+Im Ergebnis hat sich die Laufzeit von 3:24 Minuten zu 3:36 Minuten verändert, also nicht wirklich verbessert.
+// TODO baseline BRC with Valhalla
+
+////
+== Nächste Schritte
+
+Neben den schon diskutierten (Draft-)JEPs sind weitere Änderungen denkbar, eine davon ist Operator Overloading.
+
+Es gibt auch noch einige offene Fragen die teilweise in JEP402 "Enhanced Primitive Boxing" angegangen werden. 
+Können die primitiven Typen durch Werttypen ersetzt werden?
+Können primitive Typen dann Ziele von Methoden sein? Was passiert mit Generics für primitive Typen?
+Wie sieht es mit Kovarianz von int[] vs. Integer[] aus?
+////
+// In fernerer Zukunft stehen noch Themen wie Operator-Overloading, da soll Java einen konzeptionell besseren Ansatz erhalten als andere Sprachen.
+
+//TODO Parametric VM: https://openjdk.org/projects/valhalla/design-notes/parametric-vm/parametric-vm
+
+== Fazit
+
+Ich freue mich dass das Team jetzt einen Durchbruch erreicht hat und hoffe dass wir Wertypen als Preview Feature in Java 24 bekommen, vielleicht sogar schon mit einigen der weiterführenden Aspekte in den (Draft)JEPs.
+
+Dies würde viele Verbesserungen sowohl für die JDK-eigenen Typen als auch Massendatenverarbeitung ermöglichen, man denke nur einmal and Datenbanken (Neo4j, Cassandra, Elastic) und DV Systeme (Databricks, Spark, Flink, Kafka, Hadoop) die in Java implementiert sind.
+
+Mich erinnert die Valhalla Geschichte etwas an die Entwicklung von LINQ in .Net die Anders Hejlsberg mal bei einer JAOO so zusammengefasst hat: Wir haben 10 individuell nützliche Sprachfeatures nach und nach entwickelt, so dass LINQ zum Schluss nur aus der Anwendung dieser Bausteine zusamemngesetzt werden konnte.
+Brian Goetz fasst es so zusammen - Leistung kommt von klarer Struktur und Semantik, dann können die Optimierungen sicher under der Haube erfolgen. Es hilft auf unnötigen Freiheiten zu verzichten, um Optimierungspotential zu erhalten (Beschränkungen sind of hilfreich).
+
+Mit dem verfügbaren Build kann man jetzt schon selbst testen, was für Auswirkungen ein kompaktes Speicherdesign für die eigenen Anwendungen haben kann.
+
+In fernerer Zukunft stehen noch Themen wie Operator-Overloading, da soll Java einen konzeptionell besseren Ansatz erhalten als andere Sprachen, z.b. mittels Typklassen die die Operatoren gruppieren.
+
+== Referenzen
+
+* [Goetz24] Brian Goetz: JVMLS 2024 - Valhalla - Where Are We? Aug 2024  - https://www.youtube.com/watch?v=IF9l8fYfSnI
+* [Goetz15] Brian Goetz: JVMLS 2015 - Adventures on the Road to Valhalla - https://www.youtube.com/watch?v=uNgAFSUXuwc
+* [Hoare] Null References - The Billion Dollar Mistake https://www.infoq.com/presentations/Null-References-The-Billion-Dollar-Mistake-Tony-Hoare/
+* [Valhalla] Projektseite https://openjdk.org/projects/valhalla/
+* [Build] https://jdk.java.net/valhalla/
+// • Valhalla Early-Access Builds Implementing Value Classes and Objects ➤ https://jdk.java.net/valhalla/
+* [JEP401] Value Classes and Objects (Preview) - https://openjdk.org/jeps/401
+* [JEP402] Enhanced Primitive Boxing (Preview) - https://openjdk.org/jeps/402
+* [NullRestrictedValueTypes] Draft JEP - Null-Restricted Value Class Types (Preview) - https://bugs.openjdk.org/browse/JDK-8316779
+* [NullRestrictedTypes] Draft JEP - Null-Restricted and Nullable Types (Preview) - https://bugs.openjdk.org/browse/JDK-8303099
+* [ParametericVM] The Saga of the Parametric VM - https://cr.openjdk.org/~jrose/values/parametric-vm.pdf
+* [ValhallaInsideJava] Inside Java -  https://inside.java/tag/valhalla
+* [Evans] - Domain Driven Design, Value Objects https://martinfowler.com/bliki/EvansClassification.html
+
+////
+Valhalla Video
+
+Auch als “Java’’s epic refactor” bezeichnet.
+
+Deep cut through language, vm,, runtime
+
+10 years, 6 distinct research prototypes each learning a specific thing
+3 for generic specialization (understand how types and erasure flow through generics)
+Several vm prototypes (minimal value types, bytecodes vload/vstore, L world - unify class descriptors) - great performance 
+
+Each moved a bit forward
+But complex programming model
+
+Until recently not hardest questions - well designed, natural programming model, minimal, compatible migration - where is the division of responsibility between language and vm (more expensive engineering)
+Linguistic concept that unifies int - Integer - lots of mental bookkeeping on users, all the sins of boxing
+Reboot -> finer grained decomposition of difference between the types
+
+What are the impediments to flatness and density?
+Identity + nullability + iniitalization + integrity
+Identity issue number 1
+Useful for layout, mutability, polymorphism, locks
+Not every class needs identity -> then it’s a source of bugs
+Identity needs fixed location, indirection, pointers
+
+Identity
+“Value class” => instances have no identity - give up the befits for other benefits
+Many existing classes can be value classes
+Similar semantics (fields, methods, constructors, type values) - fields + class is final, == is by state, but no locking, no weak references, must extend Object or a value capable class
+“Value objects are objects” object references in programming model but gone at runtime
+Freely copyable, decomposable into fields, scalarize and reconstitute, 
+most on-stack usage is not allocating anything but uses registers or stack
+Calling conventions by fields in registers “stack flattening/scalarization”
+Immutable accumulator performance - no object allocation needed
+
+Example, cursor: pointer base array and offset -> allocating cursors in iteration -> only fields used -> proof for the vm that it can scalarize due to semantics
+
+JEP 401 - value classes - “value” keyword, few of JDK classes migration (integer, Options, LocalDate) 
+Not full flattening, some flattening in heap (for small nullable < 64bits), full scalarization, in calling conversion + returns
+You can decide if you need identity, opt out if you can
+Little new complexity for users
+
+2. Nullability
+Need an extra bit for null, in value types 
+Often means 2x the size
+Density hazard, flatness hazard (data races, initialization)
+In most numeric code null gets in the way
+Be able to decide to not need it
+Other languages - scala, kotlin, swift, c#
+Syntax Type! And Type?
+“?” “!” come from regular expressions
+Well studied problem - frequent request
+Tried to make it non-nullable by default in an earlier prototype
+
+3. Initialization (esp. For non-nullable)
+
+ What is the default value?
+VM can’t put a null
+Change assignment rule - has to given a value before superclass constructor call
+Assignment analysis
+JEP482 - constructor bodies
+Also for arrays what do they contain if not null?
+Can initialize with default value or a lambda
+String![] names = new String![](n,i -> “Name #“+i)
+
+
+
+4. Null Restricted Types (larger feature)
+Add cardinality markers through type system
+Through everything + type system + inference + conversion + pattern matching + overload selection …
+Dynamic null checks, Assing nullable to non-nullable -> null check, or method entry -> NPE
+VM checks
+We need to have migration that works with existing APIs, binary and source compatible
+
+5. Null Restricted Value Class Types
+Initialization -> memory zeroing + constructor -> non fully initialized object might be exposed to user code
+For some value types some values are not valid instances of class
+Definite assignment analysis
+Tried a prior solution (what are sensible defaults?)
+Better tighten holes in initialization - no way of observing invalid state -> jep 482
+User needs to provide default value
+Flattening can only happen if either only zero is a good default value or non-valid values are never observed/possible
+6. Strictly initialized fields
+Initialized but no one can see it
+Verification from language in the VM (verifier) not runtime
+Definitive assignment analysis (language + verifier)
+Value objects are only observed in a single state, 
+null restricted fields never observed as null even if the VM puts a null there initially
+
+Simplified user model -> simplified VM model
+New bit on classes for “value” ACC_VALUE, new bit on fields for “strict” ACC_STRICT
+New attribute NullRestricted
+Some extra means for null restricted arrays initialization
+-> unified initialization, non-zero default values, abstract classes as superclasses for values, smooth migration
+
+Needs for new bytecodes and descriptors went away
+Needs for migration complexity went away
+Strict initialization was the biggest difference -> was not obvious for a long time -> was probably a language design 
+
+⇒ linguistic complexity collapsed with the combination
+Class author opts out of degree of freedom
+
+Similar to LINQ -> Anders Hejlsberg build component language features then the final feature falls into place
+
+Lesson:
+Performance comes from clean semantics
+Flattening should be a pure optimization that can happen under the hood
+Issue of the language design
+Opt out of unnecessary degrees of freedom (identity, final, …)
+
+Migration
+Previous attempts had really bad migration modes -> evidence for not good enough model
+Here it sort itself 
+
+Serialization
+Strict initialization -> deserialize -> empty object then add values
+Some work ongoing for serialization 
+Until then value classes will not be serializable
+Better for deconstruction
+
+Java Memory Model
+Reads + writes to heap - reference + fields different values
+In language model there is still a “pointer/reference”
+Preserve illusion ?? 
+Depends on hardware -> most have 64 bit load/stores
+Old days - tearing of 64bit primitives (in early java 2x 32 bit accesses) > excuse fast numerics => hardware saved us
+128bit atomics?
+Tearing of larger value objects
+Default has to be integrity, no observed partial writes
+Need to be a way to opt out
+Tradeoff performance vs. integrity
+Current thinking - opt into relaxed atomicity 
+Will come as part of null restricted value classes
+
+Flattening / finality
+Throughout Immutability helps with data races
+Then we can flatten
+Mutable ref -> immutable object or immutable ref to mutable object are the issue
+
+Flatting scorecard
+Excellent on stack and calling convention as long as we have enough registers
+<64bit nullable or non-nullable 
+Larger value flattening requires relaxed atomictiy
+Need hardware support
+128 bits are quite large
+
+EA of first JEP
+
+Reminder JEP 402
+Eliminate differences between Integer! And int
+Receiver (num.toString)
+Type arguments
+Covariance
+int[] vs. Integer![]
+
+
+Future work
+Operator overloading? - try to avoid the disaster in other languages
+Will look at typeclasses -> group operators in a interface or so
+Specialized generics -> parametric VM
+
+////

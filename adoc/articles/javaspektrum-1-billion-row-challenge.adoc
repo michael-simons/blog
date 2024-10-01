@@ -207,6 +207,16 @@ Wie zum Beispiel die Addition eines Wertes der mit einem mitgeführten Flag mit 
 
 Nutzung verschiedener Garbage Kollektoren, wie Epsilon GC, ZGC und Shenandoah, um die Laufzeit zu verbessern.
 Besonders Epsilon GC, der keinen Speicher freigibt ist durch den Fakt, dass die Daten in den Speicher passen und das Programm nur einmal läuft und dann beendet wird, interessant.
+Durch das Memory-Mapping der Datei, und die effiziente Hashtable Implementierung wird gar nicht soviel Heap benötigt, so dass man mit 1-2 GB Heap auskommt.
+////
++JAVA_OPTS="--enable-preview -Xms1g -Xmx1g -XX:+UnlockExperimentalVMOptions -XX:+UseEpsilonGC  -XX:+AlwaysPreTouch"
+ time java $JAVA_OPTS --class-path target/average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_ddimtirov
+
+source "$HOME/.sdkman/bin/sdkman-init.sh"
+sdk use java 21.0.1-graal 1>&2
+NATIVE_IMAGE_OPTS="--gc=epsilon -O3 -march=native --enable-preview"
+native-image $NATIVE_IMAGE_OPTS -cp target/average-1.0.0-SNAPSHOT.jar -o 
+////
 
 Ein optimiertes Speicher Mapping auf 2MB große Segmente, passend zur Huge-Page-Size in Linux und den 8 Threads mit jeweils 2MB ergibt 16MB die dem Prozessor-Cache entsprechen, das konnte die Performance nochmal verbessern.
 
@@ -1482,6 +1492,9 @@ https://github.com/thomaswue/1brc/blob/c67abfcd469cbc00f89f5850cbf64a5407e21549/
 Update: Thanks to tuning from @mukel using sun.misc.Unsafe to directly access the mapped memory, it is now down to 1.28s (total CPU user time 32.2s) on my machine. Also, instead of PGO (Profile Guided Optimization), this is now just using a single native image build run with tuning flags “-O3” and “-march=native”.
 
 mmap the entire file, use Unsafe directly instead of ByteBuffer, avoid byte[] copies. These tricks give a ~30% speedup, over an already fast implementation.
+
++JAVA_OPTS="--enable-preview -Xms1g -Xmx1g -XX:+UnlockExperimentalVMOptions -XX:+UseEpsilonGC  -XX:+AlwaysPreTouch"
+ time java $JAVA_OPTS --class-path target/average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_ddimtirov
 
 source "$HOME/.sdkman/bin/sdkman-init.sh"
 sdk use java 21.0.1-graal 1>&2
